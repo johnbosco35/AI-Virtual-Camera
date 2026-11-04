@@ -1,0 +1,11 @@
+{
+  "name": "ai-virtual-camera",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev:desktop": "npm run dev -w apps/desktop",
+    "build:desktop": "npm run build -w apps/desktop",
+    "typecheck": "npm run typecheck -w apps/desktop"
+  }
+}
