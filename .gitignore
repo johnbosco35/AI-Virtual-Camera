@@ -7,3 +7,9 @@ release
 *.log
 native/**/build
 native/**/x64
+
+# Python engine
+apps/engine/.venv/
+apps/engine/data/
+**/__pycache__/
+*.pyc

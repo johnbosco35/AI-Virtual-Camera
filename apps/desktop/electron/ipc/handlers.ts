@@ -1,14 +1,18 @@
-import { app, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
-import { createHash } from 'node:crypto';
-import { machineIdSync } from 'node-machine-id';
+import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
+import { copyFile, stat } from 'node:fs/promises';
+import path from 'node:path';
+import { FrameChannel } from '../frameChannel';
 import {
   Channels,
   EXTERNAL_HOST_ALLOWLIST,
+  FrameConnectInputSchema,
+  MAX_FRAME_BYTES,
   OpenExternalInputSchema,
+  RecordingFileInputSchema,
+  type SaveResult,
   type AppInfo,
-  type DeviceFingerprint,
+  type EngineConfig,
   type PerformanceMetrics,
-  type VirtualCameraStatus,
 } from './schemas';
 
 /** Reject IPC calls that do not come from our own top-level window. */
@@ -18,28 +22,16 @@ function assertTrustedSender(event: IpcMainInvokeEvent, trustedOrigins: string[]
   if (!ok) throw new Error('Untrusted IPC sender');
 }
 
-export function registerIpcHandlers(trustedOrigins: string[]) {
+export function registerIpcHandlers(trustedOrigins: string[], engine: () => EngineConfig & { dataDir: string }) {
   ipcMain.handle(Channels.getAppInfo, (event): AppInfo => {
     assertTrustedSender(event, trustedOrigins);
-    return { name: app.getName(), version: app.getVersion(), platform: process.platform };
+    return { name: app.getName(), version: app.getVersion(), platform: process.platform, dataDir: engine().dataDir };
   });
 
-  ipcMain.handle(Channels.getDeviceFingerprint, (event): DeviceFingerprint => {
+  ipcMain.handle(Channels.getEngineConfig, (event): EngineConfig => {
     assertTrustedSender(event, trustedOrigins);
-    // Salted hash of the OS machine id. The backend (Section 2) must treat this
-    // as a client-supplied hint and combine it with server-side checks.
-    const raw = machineIdSync(true);
-    const fingerprint = createHash('sha256').update(`avc:v1:${raw}`).digest('hex');
-    return { fingerprint };
-  });
-
-  ipcMain.handle(Channels.getVirtualCameraStatus, (event): VirtualCameraStatus => {
-    assertTrustedSender(event, trustedOrigins);
-    // TODO(native): query the native virtual camera component over its control pipe.
-    if (process.platform !== 'win32') {
-      return { state: 'unsupported', detail: 'The virtual camera is available on Windows only.' };
-    }
-    return { state: 'not-installed', detail: 'Native virtual camera component is not connected yet.' };
+    const { baseUrl, token } = engine();
+    return { baseUrl, token };
   });
 
   ipcMain.handle(Channels.getPerformanceMetrics, (event): PerformanceMetrics => {
@@ -48,6 +40,54 @@ export function registerIpcHandlers(trustedOrigins: string[]) {
     const renderer = app.getAppMetrics().find((metric) => metric.pid === rendererPid);
     if (!renderer) throw new Error('Renderer CPU metrics are not available.');
     return { cpuPercent: renderer.cpu.percentCPUUsage, sampledAt: Date.now() };
+  });
+
+  const recordingFile = async (input: unknown) => {
+    const { id, format, suggestedName } = RecordingFileInputSchema.parse(input);
+    const dir = path.resolve(engine().dataDir, 'recordings');
+    const file = path.resolve(dir, `${id}.${format}`);
+    if (path.dirname(file) !== dir) throw new Error('Invalid recording path');
+    await stat(file); // throws if missing
+    const safeName = (suggestedName ?? 'recording').replace(/[^\w\- ]+/g, '').trim() || 'recording';
+    return { file, format, safeName };
+  };
+
+  ipcMain.handle(Channels.saveRecording, async (event, input: unknown): Promise<SaveResult> => {
+    assertTrustedSender(event, trustedOrigins);
+    const { file, format, safeName } = await recordingFile(input);
+    const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+    const options = {
+      title: 'Save recording',
+      defaultPath: path.join(app.getPath('videos'), `${safeName}.${format}`),
+      filters: [format === 'mp4' ? { name: 'MP4 video (H.264)', extensions: ['mp4'] } : { name: 'WebM video', extensions: ['webm'] }],
+    };
+    const result = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options);
+    if (result.canceled || !result.filePath) return { saved: false };
+    await copyFile(file, result.filePath);
+    return { saved: true, path: result.filePath };
+  });
+
+  ipcMain.handle(Channels.showRecording, async (event, input: unknown) => {
+    assertTrustedSender(event, trustedOrigins);
+    const { file } = await recordingFile(input);
+    shell.showItemInFolder(file);
+  });
+
+  // Virtual-camera frames: renderer → main → local TCP → engine (see frameChannel.ts).
+  const frames = new FrameChannel();
+  ipcMain.handle(Channels.frameConnect, async (event, input: unknown) => {
+    assertTrustedSender(event, trustedOrigins);
+    const { port, token, frameBytes } = FrameConnectInputSchema.parse(input);
+    await frames.connect(port, token, frameBytes);
+  });
+  ipcMain.handle(Channels.frameSend, async (event, frame: unknown) => {
+    assertTrustedSender(event, trustedOrigins);
+    if (!(frame instanceof Uint8Array) || frame.byteLength > MAX_FRAME_BYTES) throw new Error('Invalid frame');
+    return frames.send(frame);
+  });
+  ipcMain.handle(Channels.frameClose, (event) => {
+    assertTrustedSender(event, trustedOrigins);
+    frames.close();
   });
 
   ipcMain.handle(Channels.openExternal, async (event, input: unknown) => {

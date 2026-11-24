@@ -1,65 +1,69 @@
-# Engineering report
+# Engineering report: Avatar Studio
 
-Date of this snapshot: 2026-10-25. Status wording: implemented (code exists), tested (automated test passing), untested.
+Snapshot: 2026-11-04. Status words: **verified** (exercised end to end or by automated tests), **implemented** (code exists, not verified on real hardware), **limited** (works, with documented caveats).
 
-## 1. Implemented features
+## 1. What was verified
 
-- Desktop shell: hardened Electron, validated IPC, webcam preview with device handling, mock activation and countdown. Untested.
-- Backend: orders, USDT TRC-20 verification, reconciler, device-key activation, single-session consumption, cleanup jobs, downloads, admin API with RBAC and audit log. Untested (tests written).
-- Documentation, compatibility matrix with integrity test, deployment/operations/release plans.
+| Area | Evidence |
+| --- | --- |
+| Engine boots, seeds the 11-voice library, benchmarks the CPU | Real server run; `/api/system/status` |
+| OpenVoice V2 conversion of real speech (offline and streamed) | SAPI speech → converted WAV; WebSocket client streaming at real-time pace, including mid-stream voice switching |
+| Desktop app end to end | Production build driven over the Chrome DevTools Protocol with Chromium fake devices (a video file as webcam, a WAV as microphone): upload → landmark analysis (478 points, 100 % match) → library preview rendering → settings → studio consent → live tracking → session with buffered voice conversion → session history |
+| Avatar follows head motion | Canvas frames sampled during tracking change with the webcam head pose; visual check of a frame strip |
+| Expression rendering | Real WebGL renderer: rest, jaw open, blink, smile, 20° turn, visemes "aa"/"ee"/"oo", combined expression |
+| Rig math | 9 vitest cases (rest identity, rigid yaw without phantom mouth motion, jaw and blink transfer, viseme jaw and rounding, no-face fallback, mesh coverage) |
+| Engine | 20 unittest cases (streaming continuity, cross-fade smoothness, silence skipping, source-voice estimation, backlog bounds, visemes, block-size choice, token auth, avatar lifecycle and validation, consent enforcement, settings validation, UTC session times, WebSocket auth) |
 
-## 2. Incomplete
+Not verified: a physical webcam and microphone on this machine (the test runs used Chromium's fake devices), a CUDA GPU, multi-monitor fullscreen, and the electron-builder installer.
 
-Native virtual camera (media source DLL, frame transport, installer integration), face tracking and avatar rendering, desktop-to-API client and device key, customer website, auto-update, installer packaging and signing, client telemetry, admin MFA, object-storage downloads, shared rate-limit store.
+## 2. Face animation
 
-## 3. Architecture
+Real-time neural reenactment (LivePortrait, FOMM) needs a CUDA GPU; on the 2-core development CPU it would run at roughly 1 fps. The implemented alternative is a landmark-driven 2D reenactment rendered with WebGL2:
 
-Monorepo: `apps/desktop` (Electron + React), `apps/api` (Express + Mongoose), `native/virtualcam` (C++ design and skeleton), `docs`. API layers: routes, controllers, services, models, middlewares, validators, jobs.
+1. MediaPipe Face Landmarker tracks 478 landmarks plus blendshapes in a worker, filtered with a One-Euro filter. Only new camera frames are processed (`requestVideoFrameCallback`).
+2. A neutral pose is averaged from the first 12 frames ("Reset avatar position" recaptures it).
+3. Horn's quaternion method on rigid landmarks gives the head rotation; the residual after un-rotating is the expression.
+4. Expression deltas are scaled to the avatar's face proportions and roll, then added to the avatar's own landmarks. The avatar keeps its identity and only the motion transfers.
+5. The avatar's 3D landmarks are rotated about a pivot behind the face (parallax), with gain and a 32° cap to avoid distortion.
+6. Two outer rings derived from the face oval carry hair, ears and neck (the inner ring follows the face edge including the jaw); image borders stay fixed.
+7. Passes: outer mesh → eyes (iris-centred fans, so gaze shifts warp the eye) → procedural mouth interior (cavity, teeth, tongue; blended in only when the mouth opens beyond the portrait's rest) → depth-tested face mesh.
 
-## 4. API
+Limits: very large turns (> ~25°) can show a small fold at the far cheek. Pictures without a detectable face move as a whole. Stylised faces that MediaPipe cannot detect fall back to that mode.
 
-See `apps/api/docs/API.md`.
+## 3. Voice conversion
 
-## 5. Database
+OpenVoice V2's tone-colour converter performs zero-shot speech-to-speech: the spoken words, rhythm and intonation are kept and the timbre is replaced with the target embedding. A profile needs only an embedding extracted from at least 4 s of speech (6 s+ is recommended in the UI).
 
-Models in `apps/api/src/models`. Key indexes: unique `(network, txHash)` and `orderId` on payments; unique `orderId` and `activationCodeHash` on entitlements; partial unique active activation per entitlement; partial unique active session per entitlement; partial unique pending amount per destination; TTL on `VideoSession.deleteAt` (0 s) and `UsedNonce.expireAt`. No TTL on durable collections.
+Streaming: about 20 ms PCM frames → soxr streaming resampler → blocks (benchmark-chosen) with left context → inference in a worker thread → 40 ms equal-power cross-fade. Silent blocks skip inference. The user's own source embedding comes from Settings → calibration or is estimated from live speech.
 
-## 6. Payment workflow
+**Measured on the development PC (i5-4210U):** RTF 2.2–2.6 idle and up to ~14 while face tracking and rendering share the two cores. The decoder (HiFi-GAN) is 87 % of compute. TorchScript freezing gave no speed-up, and ONNX Runtime could not run because it needs a newer VC++ runtime than this PC has. This PC therefore runs **buffered** mode and the UI says so. Faster CPUs and CUDA GPUs run **live** mode automatically.
 
-Order gets an exact unique amount. Verification reads the transaction from TronGrid (solidified only), checks contract, destination, amount, success and chain-time window, then records the payment and creates one entitlement. The reconciler repairs partial steps and auto-matches incoming transfers.
+## 4. Lip-sync
 
-## 7. Session licensing and cleanup
+Visemes (jaw, round, wide, energy) are computed from the converted audio's short-time spectrum (formant-band energies and centroid, with attack/release smoothing) for every 256-sample hop. They travel with the audio block and are scheduled on the Web Audio clock, so the mouth follows exactly what is heard. In live mode the webcam pose is delayed by the measured voice latency so expressions line up as well. In buffered mode, expressions stay live and the mouth follows the converted voice. Lip-sync modes: webcam, converted voice, or hybrid (the converted voice opens the mouth further).
 
-Start spends the entitlement with one atomic update, then creates the session with a server-set 900 s expiry. Heartbeat never extends it. End and expiry set `endedAt` and `deleteAt = endedAt + 5 min`. The TTL monitor deletes the record asynchronously. Consumption state lives on the entitlement and survives deletion.
+## 5. Security and privacy
 
-## 8. Native camera
+The engine binds to 127.0.0.1 and requires a random per-launch token (header, or query string for media). CORS is limited to the app origins. Electron keeps its hardened setup: sandboxed renderer, context isolation, a validated IPC bridge, navigation lockdown, and permissions limited to media, speaker selection and fullscreen. CSP allows only the local engine. Uploads are validated by type, size and decodability. Consent is required for media access and recorded for every cloned voice.
 
-Design only (`native/virtualcam/DESIGN.md`) plus an unbuilt registration skeleton.
+## 6. Outputs, background and neural animation (added 2026-11-05/06)
 
-## 9. Compatibility matrix
+Measured on the development PC (i5-4210U, 2 cores, 4 GB RAM, Intel HD 4400, no CUDA), production build, Windows 10:
 
-All nine rows are `NOT_TESTED` (`docs/compatibility-matrix.json`). No real results exist.
+| Area | Result |
+| --- | --- |
+| Static background | Background probe regions changed 0–4 % of pixels during head motion (99 % with the old whole-picture warp); the face changed 99 %. Render ~41 fps (47 without) after baking the plate and the subject matte into single textures (it was 11 fps with five texture fetches per pixel). |
+| Virtual camera | Unity Capture via `pyvirtualcam`; seen by Microsoft Edge as "Unity Video Capture". Frame path: GPU compose + I420 in the renderer's own WebGL context (async PBO readback) → IPC → local TCP → engine. Measured input 12–14 fps at 720p on this PC (2 fps over the original WebSocket path, which moves only 7–18 MB/s here). The driver repeats frames at 30 fps; when frames stop for 1 s a "camera paused" card is shown, never a frozen avatar. |
+| Virtual microphone | VB-CABLE: digital silence before conversion starts (the raw microphone is never routed), converted voice peaks −13 dBFS once it arrives. |
+| Voice conversion | **Not real time on this PC**: RTF 1.67 at idle; with tracking and rendering running, latency reached 27 s. Live voice needs a CUDA GPU or a much faster CPU. |
+| Recording | Record, pause, resume, stop; WebM → H.264/AAC MP4 transcode and both containers kept; seekable (HTTP range); crash leaves the part recorded. |
+| Neural animation | LivePortrait port verified for correctness on CPU (neutral drive reconstructs the portrait, mean error 4/255; a 11° driver roll tilts the portrait's head) but takes ~420 s per frame here, so the app only offers it with a CUDA GPU. Real-time speed on a GPU is **not measured**. In neural mode the mouth follows the webcam, not the converted voice's visemes. |
 
-## 10. Security considerations and limits
+Tests: 35 engine (`npm run test:engine`), 20 desktop (`npm test -w apps/desktop`).
 
-- Anyone can copy the installer; licensing relies on the backend.
-- The 15-minute limit on **frame output** is enforced by a cooperating client. A modified client could keep writing frames locally. The native-layer signed grant in `DESIGN.md` raises the bar but cannot make it unbreakable.
-- Device keys are only as safe as their local storage.
-- Exact-amount payment matching means customers who send a different amount, or whose exchange deducts fees, are not auto-credited and need support.
-- Admin accounts lack MFA.
+## 7. Next steps
 
-## 11. Local development
-
-See the root `README.md`, `apps/desktop`, and `apps/api/README.md`.
-
-## 12. Production deployment
-
-See `docs/DEPLOYMENT.md`.
-
-## 13. Automated test results
-
-Not run. Suites written: payments (idempotency, replay, mismatches, finality, window), activation, sessions, cleanup, TTL integration against a real mongod, API validation and admin RBAC, compatibility matrix integrity.
-
-## 14. Release and recovery
-
-See `docs/RELEASE.md` and `docs/OPERATIONS.md`.
+- Optional neural reenactment path (LivePortrait ONNX on CUDA) behind the same `AvatarStage` interface.
+- Measure neural animation and voice conversion on a CUDA GPU; test each call app individually.
+- A native Windows 11 Media Foundation virtual camera (see `native/virtualcam`) so Media-Foundation-only apps can see the camera.
+- Bundled Python runtime for the installer.

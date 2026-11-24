@@ -1,59 +1,49 @@
 import { useEffect } from 'react';
 import { Sidebar } from '@/components/Sidebar';
-import { Activate } from '@/screens/Activate';
-import { Complete } from '@/screens/Complete';
-import { Help } from '@/screens/Help';
-import { Preview } from '@/screens/Preview';
-import { Session } from '@/screens/Session';
-import { Welcome } from '@/screens/Welcome';
-import { useAppStore } from '@/store/appStore';
-import { AvatarSelection } from '@/screens/AvatarSelection';
-import { DeviceVerification } from '@/screens/DeviceVerification';
-import { Privacy } from '@/screens/Privacy';
-import { VirtualCamera } from '@/screens/VirtualCamera';
-import { CameraSettings } from '@/screens/CameraSettings';
-import { Recovery } from '@/screens/Recovery';
-import { Purchase } from '@/screens/Purchase';
+import { Toasts } from '@/components/Toasts';
+import { Dashboard } from '@/screens/Dashboard';
+import { MyAvatars } from '@/screens/MyAvatars';
+import { MyVoices } from '@/screens/MyVoices';
+import { Recordings } from '@/screens/Recordings';
+import { Settings } from '@/screens/Settings';
 import { Studio } from '@/screens/Studio';
-import { Voice } from '@/screens/Voice';
-import { Background } from '@/screens/Background';
+import { VoiceLibrary } from '@/screens/VoiceLibrary';
+import { useAppStore } from '@/store/appStore';
 
 const screens = {
-  welcome: Welcome,
-  activate: Activate,
-  preview: Preview,
-  session: Session,
-  complete: Complete,
-  help: Help,
-  device: DeviceVerification,
-  avatars: AvatarSelection,
-  camera: CameraSettings,
-  'virtual-camera': VirtualCamera,
-  privacy: Privacy,
-  recovery: Recovery,
-  purchase: Purchase,
-  voice: Voice,
-  background: Background,
+  dashboard: Dashboard,
   studio: Studio,
+  avatars: MyAvatars,
+  'voice-library': VoiceLibrary,
+  'my-voices': MyVoices,
+  recordings: Recordings,
+  settings: Settings,
 } as const;
 
 export function App() {
   const screen = useAppStore((s) => s.screen);
-  const customAvatar = useAppStore((s) => s.customAvatar);
-  const customBackground = useAppStore((s) => s.customBackground);
+  const refreshStatus = useAppStore((s) => s.refreshStatus);
+  const modelState = useAppStore((s) => s.status?.model_state);
+  const online = useAppStore((s) => s.engineOnline);
   const Screen = screens[screen];
 
-  useEffect(() => () => {
-    if (customAvatar?.url) URL.revokeObjectURL(customAvatar.url);
-    if (customBackground?.url) URL.revokeObjectURL(customBackground.url);
-  }, [customAvatar?.url, customBackground?.url]);
+  // Poll the engine: quickly while it is starting or downloading, slowly once ready.
+  useEffect(() => {
+    void refreshStatus();
+    const fast = online !== true || (modelState !== 'ready' && modelState !== 'missing');
+    const timer = window.setInterval(() => void refreshStatus(), fast ? 1500 : 15000);
+    return () => window.clearInterval(timer);
+  }, [refreshStatus, online, modelState]);
 
   return (
     <div className="flex h-full">
       <Sidebar />
-      <main className="flex-1 overflow-auto p-8">
-        <Screen />
+      <main className={`min-w-0 flex-1 ${screen === 'studio' ? 'overflow-hidden p-6' : 'overflow-y-auto p-8'}`}>
+        <div key={screen} className="h-full animate-fade-in">
+          <Screen />
+        </div>
       </main>
+      <Toasts />
     </div>
   );
 }

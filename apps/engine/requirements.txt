@@ -1,0 +1,19 @@
+# Install torch first from the CPU (or CUDA) index, e.g.
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+# torch 2.5.1 is pinned because newer Windows wheels need the 14.4x Visual C++ runtime.
+torch==2.5.1
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+sqlalchemy>=2.0
+pydantic-settings>=2.4
+numpy>=1.26
+soundfile>=0.12
+soxr>=0.3.7
+librosa>=0.10
+imageio-ffmpeg>=0.5
+pillow>=10.0
+# Virtual camera output through an installed DirectShow filter (OBS Virtual Camera or Unity Capture)
+pyvirtualcam>=0.12
+# OpenVoice is installed without its TTS/text dependencies; only the tone-colour converter is used:
+#   pip install --no-deps git+https://github.com/myshell-ai/OpenVoice.git

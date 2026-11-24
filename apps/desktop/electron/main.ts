@@ -1,6 +1,7 @@
 import { app, BrowserWindow, net, protocol, session } from 'electron';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { startEngine, type EngineHandle } from './engineProcess';
 import { registerIpcHandlers } from './ipc/handlers';
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL;
@@ -8,6 +9,9 @@ const PROD_INDEX = path.join(__dirname, '../dist/index.html');
 const PROD_DIST = path.join(__dirname, '../dist');
 const APP_ORIGIN = 'avc://bundle/';
 const TRUSTED_ORIGINS = DEV_URL ? [DEV_URL] : [APP_ORIGIN];
+const ALLOWED_PERMISSIONS = new Set(['media', 'speaker-selection', 'fullscreen']);
+
+let engine: EngineHandle | null = null;
 
 function isTrustedUrl(requestUrl: string) {
   try {
@@ -41,11 +45,13 @@ async function serveBundledFile(request: Request) {
 
 function createWindow() {
   const win = new BrowserWindow({
-    width: 1100,
-    height: 720,
-    minWidth: 900,
-    minHeight: 600,
-    backgroundColor: '#0F2A33',
+    width: 1440,
+    height: 900,
+    minWidth: 1100,
+    minHeight: 700,
+    title: 'Avatar Studio',
+    backgroundColor: '#090C13',
+    autoHideMenuBar: true,
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -54,6 +60,7 @@ function createWindow() {
       sandbox: true,
       webSecurity: true,
       allowRunningInsecureContent: false,
+      backgroundThrottling: false, // keep tracking and audio scheduling smooth when the window is not focused
     },
   });
 
@@ -71,16 +78,18 @@ function createWindow() {
 
 app.whenReady().then(() => {
   if (!DEV_URL) protocol.handle('avc', serveBundledFile);
-  // Media capture and explicitly selected audio outputs are limited to our own pages.
+  engine = startEngine(path.resolve(__dirname, '..'), app.getPath('userData'));
+
+  // Camera, microphone, output selection and fullscreen are limited to our own pages.
   session.defaultSession.setPermissionRequestHandler((wc, permission, callback, details) => {
     const origin = details.requestingUrl ?? wc.getURL();
-    callback(isTrustedUrl(origin) && (permission === 'media' || permission === 'speaker-selection'));
+    callback(isTrustedUrl(origin) && ALLOWED_PERMISSIONS.has(permission));
   });
   session.defaultSession.setPermissionCheckHandler((_wc, permission, requestingOrigin) => {
-    return isTrustedUrl(requestingOrigin) && permission === 'media';
+    return isTrustedUrl(requestingOrigin) && ALLOWED_PERMISSIONS.has(permission);
   });
 
-  registerIpcHandlers(TRUSTED_ORIGINS);
+  registerIpcHandlers(TRUSTED_ORIGINS, () => ({ baseUrl: engine!.baseUrl, token: engine!.token, dataDir: engine!.dataDir }));
   createWindow();
 
   app.on('activate', () => {
@@ -91,6 +100,8 @@ app.whenReady().then(() => {
 app.on('web-contents-created', (_e, contents) => {
   contents.on('will-attach-webview', (event) => event.preventDefault());
 });
+
+app.on('before-quit', () => engine?.stop());
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
